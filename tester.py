@@ -1,13 +1,24 @@
 """
 批量测试和报告生成模块
-读取 questions.csv，逐题检索判定，生成 CSV 结果和 HTML 可视化报告。
+
+流程：
+1. 读取 questions.csv（scenario, question）
+2. 逐题向量检索 → 取最高相似度分数
+3. 判定：最高分 ≥ 阈值 → covered，< 阈值 → gap
+4. 输出 batch_results.csv（逐题明细）
+5. 生成 report.html（场景维度可视化报告）
+
+核心约束：
+- 判定只看相似度分数，绝不看"检索返回了几条"
+- 因为向量检索永远会返回 top-K 条最近邻，哪怕库里没有内容也会硬凑
+- 用返回条数判断会导致缺口系统漏报、完善度虚高
 """
 
 import csv
 import os
-import json
 from typing import List, Dict
 from collections import defaultdict
+
 
 # ============================================================
 # 问题加载
@@ -19,42 +30,48 @@ def load_questions(file_path: str) -> List[Dict]:
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"测试问题文件不存在: {file_path}")
 
-    questions = []
+    questions: List[Dict] = []
     with open(file_path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            questions.append({
+            q = {
                 "scenario": row.get("scenario", "").strip(),
                 "question": row.get("question", "").strip(),
-            })
+            }
+            if q["question"]:
+                questions.append(q)
     return questions
 
 
 # ============================================================
-# 判定逻辑
+# 判定逻辑（核心！）
 # ============================================================
 
 
 def judge(similarity_score: float, threshold: float) -> str:
     """
-    判定逻辑（核心！）：只看最高相似度分数。
-    - >= 阈值 → covered
-    - < 阈值  → gap
+    判定逻辑：
+    - 分数 ≥ 阈值 → "covered"（有覆盖）
+    - 分数 < 阈值 → "gap"（真缺口）
+
+    注意：判定只看相似度分数，绝不看检索返回条数。
+    原因：向量检索永远返回 top-K 条结果，哪怕库里没有内容也会硬凑 K 条回来。
     """
-    if similarity_score >= threshold:
-        return "covered"
-    return "gap"
+    return "covered" if similarity_score >= threshold else "gap"
 
 
 # ============================================================
-# 答案生成（可选）
+# 答案生成（可选，默认关闭）
 # ============================================================
 
 
 def generate_answer(question: str, chunks: List[Dict]) -> str:
     """
     用 LLM 根据检索到的 chunk 生成答案。
-    强制约束：只能基于提供的资料回答，没有依据就明说。
+
+    强制约束：
+    - 只能基于提供的资料回答
+    - 若资料中没有相关信息，必须明确说明
     """
     from config import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
     import requests
@@ -63,7 +80,8 @@ def generate_answer(question: str, chunks: List[Dict]) -> str:
         return "（未配置 LLM API Key，无法生成答案）"
 
     context = "\n\n---\n\n".join(
-        f"[来源: {c['file_id']}]\n{c['text']}" for c in chunks[:3]
+        f"[来源: {c.get('file_id', '')}]\n{c.get('text', '')}"
+        for c in chunks[:3]
     )
 
     system_prompt = (
@@ -73,8 +91,6 @@ def generate_answer(question: str, chunks: List[Dict]) -> str:
         '2. 如果提供的资料中没有相关信息，请直接回答："提供的资料中没有相关信息。"\n'
         "3. 回答要简洁、准确。"
     )
-
-    user_prompt = f"资料：\n{context}\n\n问题：{question}\n\n请根据以上资料回答："
 
     try:
         url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
@@ -86,15 +102,14 @@ def generate_answer(question: str, chunks: List[Dict]) -> str:
             "model": LLM_MODEL,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": f"资料：\n{context}\n\n问题：{question}\n\n请根据以上资料回答："},
             ],
             "temperature": 0.3,
             "max_tokens": 800,
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"（答案生成失败: {e}）"
 
@@ -112,22 +127,21 @@ def run_batch_test(
     enable_answer_gen: bool = False,
 ) -> List[Dict]:
     """
-    批量测试：
-    1. 加载问题
-    2. 逐题检索 + 判定
-    3. 可选生成答案
-    返回逐题结果列表。
+    批量测试：逐题检索 + 判定 + 可选答案生成。
+
+    返回: 逐题结果列表，每项包含 scenario/question/score/verdict/chunk 等内容。
     """
     questions = load_questions(questions_file)
     if not questions:
+        print("  ⚠️ 测试问题列表为空")
         return []
 
     total = len(questions)
     print(f"\n{'='*60}")
-    print(f"  批量测试：共 {total} 道题，阈值 = {threshold}")
+    print(f"  📋 批量测试：{total} 道题 | 阈值: {threshold} | Top-K: {top_k}")
     print(f"{'='*60}\n")
 
-    results = []
+    results: List[Dict] = []
     for i, q in enumerate(questions):
         search_results = vector_store.search(q["question"], top_k=top_k)
 
@@ -146,14 +160,14 @@ def run_batch_test(
             "answer": "",
         }
 
-        # 可选答案生成
+        preview = q["question"][:50] + ("..." if len(q["question"]) > 50 else "")
         if enable_answer_gen and verdict == "covered" and search_results:
-            print(f"  [{i+1}/{total}] ✅ [{q['scenario']}] {q['question'][:50]}... → {max_score:.4f} (生成答案...)")
+            print(f"  [{i+1:>2}/{total}] ✅ [{q['scenario']}] {preview} → {max_score:.4f} (生成答案...)")
             result["answer"] = generate_answer(q["question"], search_results)
         elif verdict == "gap":
-            print(f"  [{i+1}/{total}] ❌ [{q['scenario']}] {q['question'][:50]}... → {max_score:.4f} (缺口)")
+            print(f"  [{i+1:>2}/{total}] ❌ [{q['scenario']}] {preview} → {max_score:.4f} 🔴缺口")
         else:
-            print(f"  [{i+1}/{total}] ✅ [{q['scenario']}] {q['question'][:50]}... → {max_score:.4f}")
+            print(f"  [{i+1:>2}/{total}] ✅ [{q['scenario']}] {preview} → {max_score:.4f}")
 
         results.append(result)
 
@@ -161,21 +175,24 @@ def run_batch_test(
 
 
 # ============================================================
-# 场景汇总
+# 场景维度汇总
 # ============================================================
 
 
 def summarize_by_scenario(results: List[Dict], documents_dir: str) -> Dict:
     """
-    按场景汇总测试结果。
-    返回每个场景的：
-    - total: 总题数
+    按业务场景汇总测试结果。
+
+    每个场景包含：
+    - total: 该场景总题数
     - covered: 覆盖数
-    - gaps: 缺口数（及缺口详情）
+    - gaps: 缺口数
     - completeness: 完善度百分比
+    - gap_items: 缺口详情列表
     - has_documents: 该场景目录下是否有文档
+    - is_whole_missing: 是否整场景缺失
     """
-    # 获取有文档的场景列表
+    # 获取有文档的场景
     doc_scenarios = set()
     if os.path.isdir(documents_dir):
         for d in os.listdir(documents_dir):
@@ -183,10 +200,7 @@ def summarize_by_scenario(results: List[Dict], documents_dir: str) -> Dict:
                 doc_scenarios.add(d)
 
     scenarios = defaultdict(lambda: {
-        "total": 0,
-        "covered": 0,
-        "gaps": 0,
-        "gap_items": [],
+        "total": 0, "covered": 0, "gaps": 0, "gap_items": [],
     })
 
     for r in results:
@@ -203,20 +217,19 @@ def summarize_by_scenario(results: List[Dict], documents_dir: str) -> Dict:
                 "top_chunk_file": r["top_chunk_file"],
             })
 
-    # 补充计算
     summary = {}
-    for scenario_name, data in scenarios.items():
-        data["completeness"] = (
-            round(data["covered"] / data["total"] * 100, 1)
-            if data["total"] > 0 else 0
-        )
-        data["has_documents"] = scenario_name in doc_scenarios
-        # 整场景缺失判定
+    for name, data in scenarios.items():
+        if data["total"] > 0:
+            data["completeness"] = round(data["covered"] / data["total"] * 100, 1)
+        else:
+            data["completeness"] = 0
+        data["has_documents"] = name in doc_scenarios
+        # 整场景缺失：没文档，或全部题目都是缺口
         data["is_whole_missing"] = (
             not data["has_documents"]
             or (data["total"] > 0 and data["gaps"] == data["total"])
         )
-        summary[scenario_name] = dict(data)
+        summary[name] = dict(data)
 
     return summary
 
@@ -252,35 +265,36 @@ def generate_html_report(
     top_k: int,
     output_path: str,
 ):
-    """生成 HTML 可视化报告"""
+    """生成场景维度的可视化 HTML 报告"""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     total_questions = len(results)
     total_covered = sum(1 for r in results if r["verdict"] == "covered")
     total_gaps = total_questions - total_covered
     overall_completeness = (
-        round(total_covered / total_questions * 100, 1) if total_questions > 0 else 0
+        round(total_covered / total_questions * 100, 1)
+        if total_questions > 0 else 0
     )
 
     # 整场景缺失列表
-    whole_missing = [
+    whole_missing = sorted(
         name for name, s in scenario_summary.items() if s.get("is_whole_missing")
-    ]
+    )
 
-    # 场景列表按完善度排序
+    # 场景按完善度排序
     sorted_scenarios = sorted(
         scenario_summary.items(),
         key=lambda x: x[1]["completeness"],
         reverse=True,
     )
 
-    # 构建场景热力图
+    # ---- 场景热力图 ----
     heatmap_rows = ""
     for name, s in sorted_scenarios:
         pct = s["completeness"]
         if s.get("is_whole_missing"):
-            color = "#ff4444"
-            bg = "#ffe0e0"
+            color = "#c62828"
+            bg = "#ffebee"
         elif pct >= 90:
             color = "#2e7d32"
             bg = "#e8f5e9"
@@ -295,7 +309,7 @@ def generate_html_report(
             bg = "#ffebee"
 
         bar_width = min(pct, 100)
-        doc_status = "📁" if s.get("has_documents") else "⚠️ 无文档"
+        doc_status = "📁 有文档" if s.get("has_documents") else "⚠️ 无文档"
 
         heatmap_rows += f"""
         <tr>
@@ -303,27 +317,28 @@ def generate_html_report(
             <td>{doc_status}</td>
             <td class="num">{s['total']}</td>
             <td class="num">{s['covered']}</td>
-            <td class="num" style="color:{'#c62828' if s['gaps'] > 0 else '#2e7d32'}">{s['gaps']}</td>
+            <td class="num" style="color:{'#c62828' if s['gaps'] > 0 else '#2e7d32'}; font-weight:700;">{s['gaps']}</td>
             <td>
-                <div class="bar-container">
-                    <div class="bar-fill" style="width:{bar_width}%; background:{color}"></div>
-                    <span class="bar-label">{pct}%</span>
+                <div class="bar-wrap">
+                    <div class="bar" style="width:{bar_width}%; background:{color};"></div>
+                    <span class="bar-text">{pct}%</span>
                 </div>
             </td>
         </tr>"""
 
-    # 缺口详情
+    # ---- 缺口详情 ----
     gap_sections = ""
     for name, s in sorted_scenarios:
         if not s["gap_items"]:
             continue
         is_missing = s.get("is_whole_missing")
+
         gap_sections += f"""
-        <div class="scenario-section {'whole-missing' if is_missing else ''}">
+        <div class="gap-section {'whole-missing' if is_missing else ''}">
             <h3>
                 {name}
-                <span class="badge {'badge-danger' if is_missing else 'badge-warning'}">
-                    {'⚠ 整场景缺失' if is_missing else f'{s["gaps"]} 个缺口'}
+                <span class="tag {'tag-red' if is_missing else 'tag-orange'}">
+                    {'⚠ 整场景缺失' if is_missing else f'缺口 {s["gaps"]} 个'}
                 </span>
             </h3>
             <table>
@@ -338,12 +353,13 @@ def generate_html_report(
                 <tbody>"""
 
         for item in s["gap_items"]:
+            chunk_preview = item["top_chunk_text"][:200].replace("<", "&lt;").replace(">", "&gt;")
             gap_sections += f"""
                     <tr>
                         <td>{item['question']}</td>
                         <td class="num">{item['max_similarity']:.4f}</td>
-                        <td class="file-path">{item['top_chunk_file']}</td>
-                        <td class="chunk-preview">{item['top_chunk_text'][:200]}</td>
+                        <td class="file-col">{item['top_chunk_file']}</td>
+                        <td class="chunk-col">{chunk_preview}</td>
                     </tr>"""
 
         gap_sections += """
@@ -351,7 +367,7 @@ def generate_html_report(
             </table>
         </div>"""
 
-    # 完整 HTML
+    # ---- 完整 HTML ----
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -362,118 +378,119 @@ def generate_html_report(
     * {{ margin:0; padding:0; box-sizing:border-box; }}
     body {{
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-                     "Microsoft YaHei", sans-serif;
-        background: #f5f7fa; color: #333; line-height:1.6;
+                     "Microsoft YaHei", "Noto Sans SC", sans-serif;
+        background: #f0f2f5; color: #333; line-height:1.6;
     }}
-    .container {{ max-width:1200px; margin:0 auto; padding:24px; }}
-    .header {{
-        background: linear-gradient(135deg, #1a237e, #283593);
-        color: white; padding: 32px; border-radius: 12px; margin-bottom: 24px;
+    .wrap {{ max-width:1200px; margin:0 auto; padding:24px; }}
+    .hero {{
+        background: linear-gradient(135deg, #1a237e 0%, #283593 50%, #3949ab 100%);
+        color: white; padding: 36px 32px; border-radius: 14px; margin-bottom: 24px;
     }}
-    .header h1 {{ font-size:28px; margin-bottom:8px; }}
-    .header .meta {{ opacity:0.85; font-size:14px; }}
-    .stats {{ display:flex; gap:16px; margin-bottom:24px; flex-wrap:wrap; }}
-    .stat-card {{
-        flex:1; min-width:180px; background:white; padding:20px;
-        border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.08);
-        text-align:center;
+    .hero h1 {{ font-size:28px; margin-bottom:8px; letter-spacing:1px; }}
+    .hero .sub {{ opacity:0.85; font-size:14px; }}
+    .cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; margin-bottom:24px; }}
+    .card {{
+        background:white; padding:20px; border-radius:10px;
+        box-shadow:0 2px 8px rgba(0,0,0,0.06); text-align:center;
     }}
-    .stat-card .value {{ font-size:32px; font-weight:700; }}
-    .stat-card .label {{ font-size:13px; color:#666; margin-top:4px; }}
-    .stat-card.gap .value {{ color:#c62828; }}
-    .stat-card.covered .value {{ color:#2e7d32; }}
-    .stat-card.completeness .value {{ color:#1565c0; }}
+    .card .val {{ font-size:36px; font-weight:700; }}
+    .card .lbl {{ font-size:13px; color:#888; margin-top:6px; }}
+    .card.gap .val {{ color:#c62828; }}
+    .card.ok .val {{ color:#2e7d32; }}
+    .card.pct .val {{ color:#1565c0; }}
 
     .alert {{
-        background:#fff3e0; border-left:4px solid #ef6c00;
-        padding:16px 20px; border-radius:8px; margin-bottom:20px;
-        font-size:15px;
+        padding:16px 20px; border-radius:10px; margin-bottom:20px; font-size:15px;
     }}
-    .alert-danger {{
-        background:#ffebee; border-left-color:#c62828; color:#b71c1c;
-    }}
-    .alert strong {{ color:#c62828; }}
+    .alert-red {{ background:#ffebee; border-left:4px solid #c62828; color:#b71c1c; }}
+    .alert-red strong {{ color:#c62828; }}
 
-    .section {{ background:white; border-radius:10px; padding:24px; margin-bottom:20px;
-                box-shadow:0 2px 8px rgba(0,0,0,0.06); }}
-    .section h2 {{ font-size:20px; margin-bottom:16px; color:#1a237e; border-bottom:2px solid #e8eaf6; padding-bottom:8px; }}
+    .block {{
+        background:white; border-radius:10px; padding:24px; margin-bottom:20px;
+        box-shadow:0 2px 8px rgba(0,0,0,0.04);
+    }}
+    .block h2 {{
+        font-size:19px; margin-bottom:16px; color:#1a237e;
+        border-bottom:2px solid #e8eaf6; padding-bottom:10px;
+    }}
 
     table {{ width:100%; border-collapse:collapse; font-size:14px; }}
-    th {{ background:#f5f7fa; padding:10px 12px; text-align:left; font-weight:600;
-          border-bottom:2px solid #e0e0e0; white-space:nowrap; }}
+    th {{ background:#f5f6fa; padding:10px 12px; text-align:left; font-weight:600;
+          border-bottom:2px solid #ddd; white-space:nowrap; }}
     td {{ padding:10px 12px; border-bottom:1px solid #eee; vertical-align:top; }}
-    tr:hover {{ background:#fafafa; }}
+    tr:hover td {{ background:#fafbfc; }}
     .num {{ text-align:center; font-variant-numeric:tabular-nums; }}
-    .file-path {{ font-size:12px; color:#888; max-width:150px; overflow:hidden;
+    .file-col {{ font-size:12px; color:#888; max-width:140px; overflow:hidden;
                   text-overflow:ellipsis; white-space:nowrap; }}
-    .chunk-preview {{ font-size:13px; color:#555; max-width:400px; }}
+    .chunk-col {{ font-size:13px; color:#555; max-width:400px; }}
 
-    .bar-container {{
-        display:flex; align-items:center; gap:8px; min-width:120px;
+    .bar-wrap {{ display:flex; align-items:center; gap:8px; min-width:140px; }}
+    .bar {{
+        height:22px; border-radius:4px; min-width:4px;
+        transition:width 0.4s ease;
     }}
-    .bar-fill {{
-        height:20px; border-radius:4px; min-width:4px; transition:width 0.3s;
-    }}
-    .bar-label {{ font-size:12px; font-weight:600; white-space:nowrap; }}
+    .bar-text {{ font-size:13px; font-weight:600; white-space:nowrap; }}
 
-    .scenario-section {{ margin-bottom:24px; }}
-    .scenario-section h3 {{
-        font-size:17px; margin-bottom:10px; display:flex; align-items:center; gap:10px;
+    .gap-section {{ margin-bottom:28px; }}
+    .gap-section h3 {{
+        font-size:17px; margin-bottom:12px; display:flex; align-items:center; gap:10px;
     }}
-    .badge {{
-        font-size:12px; padding:3px 10px; border-radius:12px; font-weight:500;
+    .tag {{
+        font-size:11px; padding:3px 10px; border-radius:12px; font-weight:500;
     }}
-    .badge-danger {{ background:#ffcdd2; color:#b71c1c; }}
-    .badge-warning {{ background:#fff3e0; color:#e65100; }}
-
+    .tag-red {{ background:#ffcdd2; color:#b71c1c; }}
+    .tag-orange {{ background:#fff3e0; color:#e65100; }}
     .whole-missing h3 {{ color:#c62828; }}
 
     .footer {{
-        text-align:center; color:#999; font-size:12px; padding:20px; margin-top:20px;
+        text-align:center; color:#aaa; font-size:12px; padding:24px; margin-top:8px;
     }}
 
     @media print {{
         body {{ background:white; }}
-        .container {{ max-width:100%; }}
-        .stat-card, .section {{ box-shadow:none; border:1px solid #ddd; }}
+        .wrap {{ max-width:100%; }}
+        .card, .block {{ box-shadow:none; border:1px solid #ddd; }}
     }}
 </style>
 </head>
 <body>
-<div class="container">
+<div class="wrap">
 
-    <div class="header">
+    <div class="hero">
         <h1>📊 知识库缺口探测报告</h1>
-        <div class="meta">
-            判定阈值: {threshold} | 检索 Top-K: {top_k} | 共 {total_questions} 道测试题
+        <div class="sub">
+            判定阈值: {threshold} &nbsp;|&nbsp;
+            检索 Top-K: {top_k} &nbsp;|&nbsp;
+            共 {total_questions} 道测试题
         </div>
     </div>
 
-    <div class="stats">
-        <div class="stat-card completeness">
-            <div class="value">{overall_completeness}%</div>
-            <div class="label">整体完善度</div>
+    <div class="cards">
+        <div class="card pct">
+            <div class="val">{overall_completeness}%</div>
+            <div class="lbl">整体完善度</div>
         </div>
-        <div class="stat-card covered">
-            <div class="value">{total_covered}</div>
-            <div class="label">已覆盖</div>
+        <div class="card ok">
+            <div class="val">{total_covered}</div>
+            <div class="lbl">已覆盖</div>
         </div>
-        <div class="stat-card gap">
-            <div class="value">{total_gaps}</div>
-            <div class="label">真缺口</div>
+        <div class="card gap">
+            <div class="val">{total_gaps}</div>
+            <div class="lbl">真缺口</div>
         </div>
-        <div class="stat-card">
-            <div class="value">{len(sorted_scenarios)}</div>
-            <div class="label">业务场景</div>
+        <div class="card">
+            <div class="val">{len(sorted_scenarios)}</div>
+            <div class="lbl">业务场景</div>
         </div>
     </div>
 
-    {f'''<div class="alert alert-danger">
-        <strong>⚠️ 整场景缺失警告：</strong> 以下场景可能完全缺少文档或全部题目均为缺口 —
+    {f'''<div class="alert alert-red">
+        <strong>⚠️ 整场景缺失警告：</strong>
+        以下场景可能完全缺少文档或全部题目均为缺口 —
         {', '.join(whole_missing)}
     </div>''' if whole_missing else ''}
 
-    <div class="section">
+    <div class="block">
         <h2>📋 场景 × 完善度总览</h2>
         <table>
             <thead>
@@ -492,13 +509,13 @@ def generate_html_report(
         </table>
     </div>
 
-    <div class="section">
-        <h2>🔍 真缺口详情（附最高分 & 最相似片段）</h2>
+    <div class="block">
+        <h2>🔍 真缺口详情（附最高分 &amp; 最相似片段，供人工复核）</h2>
         {gap_sections if gap_sections else '<p style="color:#2e7d32; font-size:15px;">🎉 所有题目均有覆盖，未发现知识缺口！</p>'}
     </div>
 
     <div class="footer">
-        知识库缺口探测系统 · 基于向量检索 + 相似度阈值判定
+        知识库缺口探测系统 &mdash; 用问答当探针，自动发现知识库的内容缺口
     </div>
 
 </div>
@@ -511,7 +528,7 @@ def generate_html_report(
 
 
 # ============================================================
-# 主流程：run_test
+# 主流程
 # ============================================================
 
 
@@ -525,17 +542,20 @@ def run_test(
     batch_csv_path: str = "",
     report_html_path: str = "",
 ):
-    """执行完整测试流程并生成报告"""
+    """执行完整测试流程：批量测试 → CSV → 场景汇总 → HTML 报告"""
     # 1. 批量测试
     results = run_batch_test(
         questions_file, vector_store, threshold, top_k, enable_answer_gen
     )
 
+    if not results:
+        return [], {}
+
     # 2. 保存逐题 CSV
     if batch_csv_path:
         save_batch_csv(results, batch_csv_path)
 
-    # 3. 场景汇总
+    # 3. 场景维度汇总
     scenario_summary = summarize_by_scenario(results, documents_dir)
 
     # 4. 打印摘要
@@ -544,18 +564,18 @@ def run_test(
     gaps = total - covered
 
     print(f"\n{'='*60}")
-    print(f"  测试完成")
+    print(f"  ✅ 测试完成")
     print(f"{'='*60}")
-    print(f"  总题数: {total}")
-    print(f"  已覆盖: {covered} ({round(covered/total*100,1) if total else 0}%)")
-    print(f"  真缺口: {gaps}")
-    print(f"  涉及场景: {len(scenario_summary)}")
+    print(f"  总题数:     {total}")
+    print(f"  已覆盖:     {covered}  ({round(covered/total*100,1) if total else 0}%)")
+    print(f"  真缺口:     {gaps}")
+    print(f"  涉及场景:   {len(scenario_summary)}")
 
-    whole_missing = [
+    whole_missing_list = sorted(
         name for name, s in scenario_summary.items() if s.get("is_whole_missing")
-    ]
-    if whole_missing:
-        print(f"\n  ⚠️ 整场景缺失: {', '.join(whole_missing)}")
+    )
+    if whole_missing_list:
+        print(f"  ⚠️ 整场景缺失: {', '.join(whole_missing_list)}")
 
     print()
 

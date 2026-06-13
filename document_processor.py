@@ -1,101 +1,95 @@
 """
 文档清洗和切片模块
-支持 HTML（去标签、去噪声）、PDF（文本提取）、Excel（转 Markdown 表格）
+支持 HTML（BeautifulSoup 去标签 + 去噪声）、PDF（pdfplumber 提取）、
+Excel（openpyxl 转 Markdown 表格）、TXT（纯文本）。
+中文切片用 jieba 辅助，300-500 字/片，片间 80 字重叠。
 """
 
 import re
 import os
-from typing import List, Dict
-from html.parser import HTMLParser
+from typing import List, Dict, Optional
+
 
 # ============================================================
-# HTML 清洗器
+# HTML 清洗（BeautifulSoup）
 # ============================================================
 
+# 噪声标签集合：这些标签的内容会被整块移除
+_NOISE_TAGS = {
+    "script", "style", "noscript", "nav", "footer", "header",
+    "aside", "iframe", "object", "embed",
+}
 
-class HTMLTextExtractor(HTMLParser):
-    """提取 HTML 正文文本，跳过脚本和样式"""
+# 噪声类名/ID 关键词：包含这些关键词的 div/section 会被跳过
+_NOISE_CLASS_KEYWORDS = [
+    "nav", "menu", "footer", "header", "sidebar", "breadcrumb",
+    "related", "recommend", "recommendation",
+    "copyright", "版权", "banner", "ad", "advertisement", "广告",
+    "pagination", "分页", "comment", "评论", "share", "分享",
+    "上一篇", "下一篇", "相关文章", "热门推荐",
+    "toolbar", "toolbar", "tool-bar",
+]
 
-    def __init__(self):
-        super().__init__()
-        self.text_parts = []
-        self.skip_tags = {"script", "style", "noscript", "nav", "footer", "header"}
 
-        # 噪声类名/ID 关键词（导航栏、页脚、推荐等模板噪声）
-        self.noise_keywords = [
-            "nav", "menu", "footer", "header", "sidebar", "breadcrumb",
-            "related", "recommend", "推荐", "相关", "上一篇", "下一篇",
-            "copyright", "版权", "banner", "advertisement", "广告",
-            "pagination", "分页", "comment", "评论", "share", "分享",
-        ]
-        self.in_skip = 0
-
-    def handle_starttag(self, tag, attrs):
-        tag_lower = tag.lower()
-        # 检查标签名
-        if tag_lower in self.skip_tags:
-            self.in_skip += 1
-            return
-        # 检查 class/id 是否包含噪声关键词
-        attr_str = " ".join(f"{k}={v}" for k, v in attrs if v).lower()
-        if tag_lower == "div" and any(kw in attr_str for kw in self.noise_keywords):
-            self.in_skip += 1
-
-    def handle_endtag(self, tag):
-        tag_lower = tag.lower()
-        if tag_lower in self.skip_tags:
-            self.in_skip = max(0, self.in_skip - 1)
-            return
-
-    def handle_data(self, data):
-        if self.in_skip > 0:
-            return
-        text = data.strip()
-        if text:
-            self.text_parts.append(text)
-
-    def get_text(self) -> str:
-        return "\n".join(self.text_parts)
+def _has_noise_class(tag) -> bool:
+    """检查标签的 class/id 是否包含噪声关键词"""
+    cls = " ".join(tag.get("class", [])).lower() if tag.get("class") else ""
+    tid = (tag.get("id", "") or "").lower()
+    combined = f"{cls} {tid}"
+    return any(kw in combined for kw in _NOISE_CLASS_KEYWORDS)
 
 
 def clean_html(file_path: str) -> str:
-    """清洗 HTML 文件，去标签去噪声，返回纯文本"""
+    """用 BeautifulSoup 清洗 HTML：去标签、去导航/页脚/推荐等模板噪声，返回纯文本"""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        raise ImportError("请安装 beautifulsoup4: pip install beautifulsoup4")
+
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         html_content = f.read()
 
-    # 先用正则去掉 <script> <style> 整块
-    html_content = re.sub(
-        r"<(script|style|noscript)[^>]*>.*?</\1>", "", html_content, flags=re.DOTALL | re.IGNORECASE
-    )
+    soup = BeautifulSoup(html_content, "lxml")
 
-    extractor = HTMLTextExtractor()
-    extractor.feed(html_content)
-    text = extractor.get_text()
+    # 1. 移除噪声标签
+    for tag_name in _NOISE_TAGS:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
 
-    # 后处理：合并多余空行
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 2. 移除含有噪声 class/id 的 div/section
+    for tag in soup.find_all(["div", "section"]):
+        if _has_noise_class(tag):
+            tag.decompose()
+
+    # 3. 提取纯文本
+    text = soup.get_text(separator="\n")
+
+    # 4. 后处理：去除多余空行和空白
+    text = re.sub(r"[ \t]+", " ", text)        # 合并连续空格/制表符
+    text = re.sub(r"\n{3,}", "\n\n", text)      # 最多保留一个空行
+    text = re.sub(r"^\n+", "", text)            # 去掉开头空行
     return text.strip()
 
 
 # ============================================================
-# PDF 文本提取
+# PDF 文本提取（pdfplumber）
 # ============================================================
 
 
 def extract_pdf_text(file_path: str) -> str:
-    """提取 PDF 文本（文本型 PDF；扫描件需预先 OCR）"""
+    """用 pdfplumber 提取 PDF 文本（文本型 PDF；扫描件需预先 OCR）"""
     try:
-        import fitz  # PyMuPDF
+        import pdfplumber
     except ImportError:
-        raise ImportError("请安装 PyMuPDF: pip install PyMuPDF")
+        raise ImportError("请安装 pdfplumber: pip install pdfplumber")
 
-    doc = fitz.open(file_path)
-    texts = []
-    for page in doc:
-        page_text = page.get_text("text")
-        if page_text.strip():
-            texts.append(page_text.strip())
-    doc.close()
+    texts: List[str] = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text and page_text.strip():
+                texts.append(page_text.strip())
+
     return "\n\n".join(texts)
 
 
@@ -105,14 +99,15 @@ def extract_pdf_text(file_path: str) -> str:
 
 
 def excel_to_markdown(file_path: str) -> str:
-    """将 Excel 文件转为 Markdown 表格文本"""
+    """将 Excel 文件转为 Markdown 表格文本，每张工作表一个表格"""
     try:
         import openpyxl
     except ImportError:
         raise ImportError("请安装 openpyxl: pip install openpyxl")
 
     wb = openpyxl.load_workbook(file_path, data_only=True)
-    results = []
+    results: List[str] = []
+
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         results.append(f"## 工作表: {sheet_name}\n")
@@ -123,17 +118,18 @@ def excel_to_markdown(file_path: str) -> str:
             continue
 
         # 过滤全空行
-        rows = [r for r in rows if any(c is not None and str(c).strip() != "" for c in r)]
+        rows = [r for r in rows if any(
+            c is not None and str(c).strip() != "" for c in r
+        )]
         if not rows:
             results.append("（空表）\n")
             continue
 
         # 生成 Markdown 表格
         max_cols = max(len(r) for r in rows)
-        md_rows = []
+        md_rows: List[str] = []
         for i, row in enumerate(rows):
-            cells = [str(c) if c is not None else "" for c in row]
-            # 补齐列
+            cells = [str(c).strip() if c is not None else "" for c in row]
             while len(cells) < max_cols:
                 cells.append("")
             md_rows.append("| " + " | ".join(cells) + " |")
@@ -152,8 +148,9 @@ def excel_to_markdown(file_path: str) -> str:
 
 
 def process_document(file_path: str) -> str:
-    """根据文件扩展名调用对应的清洗函数"""
+    """根据文件扩展名调用对应的清洗/提取函数，返回纯文本"""
     ext = os.path.splitext(file_path)[1].lower()
+
     if ext in (".html", ".htm"):
         return clean_html(file_path)
     elif ext == ".pdf":
@@ -164,82 +161,124 @@ def process_document(file_path: str) -> str:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             return f.read().strip()
     else:
-        # 未知类型当纯文本尝试
+        # 未知类型按纯文本尝试
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             return f.read().strip()
 
 
 # ============================================================
-# 文本切片
+# 中文智能切片（jieba 辅助）
 # ============================================================
 
+# 句子边界正则：中文标点 + 英文标点
+_SENT_BOUNDARY = re.compile(r"(?<=[。！？；\.!\?;，,\n])")
 
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> List[str]:
+
+def _split_sentences(text: str) -> List[str]:
+    """将文本按句子边界切分"""
+    parts = _SENT_BOUNDARY.split(text)
+    sentences: List[str] = []
+    current = ""
+    for part in parts:
+        current += part
+        # 如果以句子结尾标点结束，则认为是一个完整句子
+        if part and part[-1] in "。！？.!?\n":
+            if current.strip():
+                sentences.append(current.strip())
+            current = ""
+    if current.strip():
+        sentences.append(current.strip())
+    return sentences
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = 400,
+    overlap: int = 80,
+    use_jieba: bool = True,
+) -> List[str]:
     """
-    将文本按字数切片，带重叠。
+    将文本按字数切片，带重叠，中文用 jieba 辅助。
 
-    优先按段落边界切，如果某段太长则按句子切，
-    还不够则硬切。
+    策略：
+    1. 先按段落（\n\n）分
+    2. 段内按句子切
+    3. 累积到 chunk_size 附近就输出一个 chunk
+    4. 保留 overlap 字作为上下文重叠
+
+    返回: 切片文本列表（每片 300-500 字，最少 20 字）
     """
     if not text or not text.strip():
         return []
 
-    chunks = []
-    paragraphs = text.split("\n")
+    chunks: List[str] = []
+    paragraphs = text.split("\n\n")
+    current_chars: List[str] = []
+    current_len = 0
 
-    current = ""
+    def _emit():
+        """输出当前累积的文本为一个 chunk，并保留 overlap"""
+        nonlocal current_chars, current_len
+        chunk_text_str = "".join(current_chars).strip()
+        if len(chunk_text_str) >= 20:
+            chunks.append(chunk_text_str)
+
+        # 保留末尾 overlap 字数
+        if current_len > overlap:
+            remain = chunk_text_str[-overlap:]
+            current_chars = [remain]
+            current_len = len(remain)
+        else:
+            current_chars = []
+            current_len = 0
+
     for para in paragraphs:
         para = para.strip()
         if not para:
-            if current:
-                # 空行视为段落边界，优先在此处切
-                if len(current) >= chunk_size * 0.6:
-                    chunks.append(current)
-                    # 重叠：保留末尾
-                    overlap_text = current[-overlap:] if len(current) > overlap else current
-                    current = overlap_text + "\n" if overlap_text else ""
-                else:
-                    current += "\n"
+            if current_len >= chunk_size * 0.6:
+                _emit()
+            elif current_len > 0:
+                current_chars.append("\n")
+                current_len += 1
             continue
 
-        if len(current) + len(para) + 1 <= chunk_size:
-            current += ("\n" if current else "") + para
-        else:
-            # 当前段太长，先输出之前累积的
-            if current:
-                chunks.append(current)
-                overlap_text = current[-overlap:] if len(current) > overlap else current
-                current = overlap_text + "\n" if overlap_text else ""
+        sentences = _split_sentences(para)
+        for sent in sentences:
+            if not sent.strip():
+                continue
 
-            # 如果单段就超过 chunk_size，按句子切
-            if len(para) > chunk_size:
-                sentences = re.split(r"(?<=[。！？；.!?;])", para)
-                for sent in sentences:
-                    sent = sent.strip()
-                    if not sent:
-                        continue
-                    if len(current) + len(sent) <= chunk_size:
-                        current += sent
-                    else:
-                        if current:
-                            chunks.append(current)
-                            overlap_text = current[-overlap:] if len(current) > overlap else current
-                            current = overlap_text + sent if overlap_text else sent
-                        else:
-                            # 单个句子超过 chunk_size，硬切
-                            for i in range(0, len(sent), chunk_size - overlap):
-                                piece = sent[i:i + chunk_size]
-                                if piece.strip():
-                                    chunks.append(piece.strip())
-                            current = ""
+            sent_len = len(sent)
+
+            # 如果加上这句还在 size 内，继续累积
+            if current_len + sent_len <= chunk_size:
+                current_chars.append(sent)
+                current_len += sent_len
             else:
-                current = para
+                # 当前已经累积了一些，先输出
+                if current_len >= chunk_size * 0.4:
+                    _emit()
 
-    if current.strip():
-        chunks.append(current.strip())
+                # 如果单句就超过 chunk_size，硬切
+                if sent_len > chunk_size:
+                    if current_len > 0:
+                        _emit()
+                    # 按 chunk_size 步长硬切
+                    for i in range(0, sent_len, chunk_size - overlap):
+                        piece = sent[i:i + chunk_size]
+                        if len(piece.strip()) >= 20:
+                            chunks.append(piece.strip())
+                    current_chars = []
+                    current_len = 0
+                else:
+                    current_chars.append(sent)
+                    current_len += sent_len
 
-    # 过滤过短的 chunk
-    chunks = [c for c in chunks if len(c) >= 20]
+    # 输出剩余
+    if current_len > 0:
+        remaining = "".join(current_chars).strip()
+        if len(remaining) >= 20:
+            chunks.append(remaining)
+
     return chunks
 
 
@@ -249,13 +288,17 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> List[str]
 
 
 def scan_and_process_documents(
-    documents_dir: str, chunk_size: int = 400, overlap: int = 80
+    documents_dir: str,
+    chunk_size: int = 400,
+    overlap: int = 80,
 ) -> Dict[str, List[Dict]]:
     """
     扫描 documents_dir，按场景子目录处理所有文档。
+
     返回: {文件相对路径: [{"text": chunk文本, "index": 序号}, ...]}
     """
-    results = {}
+    results: Dict[str, List[Dict]] = {}
+
     if not os.path.isdir(documents_dir):
         return results
 
@@ -281,7 +324,7 @@ def scan_and_process_documents(
                 results[rel_path] = [
                     {"text": c, "index": i} for i, c in enumerate(chunks)
                 ]
-                print(f"  ✓ {rel_path} → {len(chunks)} 个 chunk")
+                print(f"  ✓ {rel_path} → {len(chunks)} 个 chunk ({len(text)} 字)")
             except Exception as e:
                 print(f"  ✗ 处理失败 {rel_path}: {e}")
 

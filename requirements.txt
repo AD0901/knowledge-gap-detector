@@ -1,6 +1,16 @@
-chromadb>=0.4.0
-sentence-transformers>=2.2.0
-numpy>=1.24.0
-requests>=2.28.0
-PyMuPDF>=1.23.0
-openpyxl>=3.1.0
+# === 核心依赖 ===
+chromadb>=0.4.0,<0.6.0         # 向量存储和检索
+sentence-transformers>=2.2.0    # BGE 中文 embedding 模型
+numpy>=1.24.0                   # 数值计算
+
+# === 文档处理 ===
+beautifulsoup4>=4.12.0          # HTML 清洗（去标签、去噪声）
+lxml>=4.9.0                     # BeautifulSoup 解析器
+pdfplumber>=0.10.0              # PDF 文本提取
+openpyxl>=3.1.0                 # Excel 转 Markdown 表格
+
+# === 中文处理 ===
+jieba>=0.42.0                   # 中文分词（辅助智能切片）
+
+# === 可选 ===
+requests>=2.28.0                # API 调用（embedding API / LLM 答案生成）
